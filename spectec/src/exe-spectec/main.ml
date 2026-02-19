@@ -14,6 +14,7 @@ type target =
  | Splice of Backend_splice.Config.t
  | Interpreter of string list
  | Rocq
+ | Lean4
 
 type pass =
   | Sub
@@ -241,6 +242,7 @@ let argspec = Arg.align (
     " Generate interpreter";
   "--rocq", Arg.Unit (fun () -> target := Rocq), " Generate Rocq Inductive Definitions (-o main.v [wf.v]: well-formedness lemmas go to wf.v, default main_wf.v)";
   "--rocq-namespace", Arg.Set_string rocq_namespace, " Logical path used by the Rocq well-formedness lemma file to import the main file";
+  "--lean4", Arg.Unit (fun () -> target := Lean4), " Generate Lean4 specification";
   "--debug", Arg.Unit (fun () -> Backend_interpreter.Debugger.debug := true),
     " Debug interpreter";
   "--unified-vars", Arg.Unit (fun () -> Il2al.Unify.rename := false),
@@ -295,7 +297,7 @@ let () =
     (match !target with
     | Prose _ | Splice _ | Interpreter _ ->
       enable_pass Sideconditions;
-    | Rocq -> 
+    | Rocq | Lean4 ->
       enable_pass Sideconditions;
       enable_pass Totalize;
       enable_pass Else;
@@ -338,7 +340,7 @@ let () =
     if !print_final_il && not !print_all_il then print_il il;
 
     let al =
-      if not !print_al && !print_al_o = "" && (!target = Check || !target = Ast || !target = Latex || !target = Rocq) then []
+      if not !print_al && !print_al_o = "" && (!target = Check || !target = Ast || !target = Latex || !target = Rocq || !target = Lean4) then []
       else (
         log "Translating to AL...";
         let interp = match !target with
@@ -466,6 +468,19 @@ let () =
         in
         write_file odst coq_code;
         write_file wf_odst wf_code
+      | _ ->
+        prerr_endline "too many output file names";
+        exit 2
+      )
+    | Lean4 ->
+      log "Lean Generation...";
+      (match !odsts with
+      | [] -> print_endline (Backend_lean4.Print.string_of_script il)
+      | [odst] -> 
+        let code = Backend_lean4.Print.string_of_script il in
+        let oc = Out_channel.open_text odst in
+        Fun.protect (fun () -> Out_channel.output_string oc code)
+          ~finally:(fun () -> Out_channel.close oc)
       | _ ->
         prerr_endline "too many output file names";
         exit 2
