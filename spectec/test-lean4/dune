@@ -3,7 +3,7 @@
     Wasm.lean.act
   )
   (action
-    (system "../src/exe-spectec/main.exe ../../../../specification/wasm-3.0/[012345]*.spectec -v -l --lean4 -o Wasm.lean.act")
+    (system "../src/exe-spectec/main.exe ../../../../specification/wasm-3.0/*.spectec -v -l --lean4 -o Wasm.lean.act")
   )
   (deps
     (file ../src/exe-spectec/main.exe)

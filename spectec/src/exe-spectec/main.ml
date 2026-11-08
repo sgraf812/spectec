@@ -313,7 +313,7 @@ let () =
       enable_pass ElseSimp;
       enable_pass PatSimp;
       enable_pass LetIntroMech;
-      sideconditions_on_defs := true;
+      sideconditions_on_defs := (!target = Rocq);
     | _ when !print_al || !print_al_o <> "" ->
       enable_pass Sideconditions;
     | _ -> ()
