@@ -706,8 +706,11 @@ let get_type_alias_id def =
   | TypD (id, _, [inst]) when is_alias_typ inst -> Some id.it
   | _ -> None
 
-let has_prems c = 
+(* A clause whose only premise is `otherwise` applies when no earlier clause does, which is the
+   first-match semantics of the printed `match`. *)
+let has_prems c =
   match c.it with
+  | DefD (_, _, _, [{it = ElsePr; _}]) -> false
   | DefD (_, _, _, prems) -> prems <> []
 
 (* In-order traversal of args, collecting variables. Only support expressions that we expect in function patterns *)
