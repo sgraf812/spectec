@@ -465,10 +465,25 @@ let render_match_args params args =
 let string_of_relation_args typ = 
   string_of_list "" " -> " " -> " (render_type REL) (transform_case_typ typ)
   
+(* A boolean side condition as a proposition. *)
+let rec render_prop exp =
+  match exp.it with
+  | CmpE (`EqOp, _, e1, e2) -> parens (render_exp REL e1 ^ " = " ^ render_exp REL e2)
+  | CmpE (`NeOp, _, e1, e2) -> parens (render_exp REL e1 ^ " ≠ " ^ render_exp REL e2)
+  | BinE (`AndOp, _, e1, e2) -> parens (render_prop e1 ^ " ∧ " ^ render_prop e2)
+  | BinE (`OrOp, _, e1, e2) -> parens (render_prop e1 ^ " ∨ " ^ render_prop e2)
+  | BinE (`ImplOp, _, e1, e2) -> parens (render_prop e1 ^ " → " ^ render_prop e2)
+  | BinE (`EquivOp, _, e1, e2) -> parens (render_prop e1 ^ " ↔ " ^ render_prop e2)
+  | UnE (`NotOp, _, e1) -> parens ("¬" ^ render_prop e1)
+  | MemE (e1, e2) -> parens (render_exp REL e1 ^ " ∈ " ^ render_exp REL e2)
+  | BoolE true -> "True"
+  | BoolE false -> "False"
+  | _ -> render_exp REL exp
+
 let rec render_prem prem =
   let r_func = render_prem in 
   match prem.it with
-  | IfPr exp -> render_exp REL exp
+  | IfPr exp -> render_prop exp
   | RulePr (id, args, _m, exp) -> parens (id.it ^
     string_of_list_prefix " " " " (render_arg REL) args ^
     string_of_list_prefix " " " " (render_exp REL) (transform_case_tup exp))
@@ -499,6 +514,52 @@ let let_quants prems =
 let render_typealias id binds typ = 
   "abbrev " ^ render_id id ^ render_binders binds ^ " : Type := " ^ render_type RHS typ
 
+(* The types whose equality is decided classically: the members of a type group that occurs in
+   its own constructor arguments under a type constructor (`List instr` in `instr`), for which
+   `deriving DecidableEq` has no handler. *)
+let classical_eq_types : StringSet.t ref = ref StringSet.empty
+
+let deriving_clause id =
+  if StringSet.mem id !classical_eq_types then "deriving Inhabited"
+  else "deriving Inhabited, DecidableEq"
+
+let rec group_typds def =
+  match def.it with
+  | TypD (id, _, [inst]) when is_variant_typ inst || is_record_typ inst -> [(id.it, inst)]
+  | RecD defs -> List.concat_map group_typds defs
+  | _ -> []
+
+let is_nested_group typds =
+  let ids = List.map fst typds in
+  let rec mentions t =
+    match t.it with
+    | VarT (id, args) -> List.mem id.it ids || List.exists mentions_arg args
+    | IterT (t', _) -> mentions t'
+    | TupT ts -> List.exists (fun (_, t') -> mentions t') ts
+    | _ -> false
+  and mentions_arg a = match a.it with TypA t -> mentions t | _ -> false in
+  let nested t =
+    match t.it with
+    | VarT (_, args) -> List.exists mentions_arg args
+    | IterT (t', _) -> mentions t'
+    | TupT ts -> List.exists (fun (_, t') -> mentions t') ts
+    | _ -> false
+  in
+  List.exists (fun (_, inst) -> match inst.it with
+    | InstD (_, _, {it = VariantT cases; _}) ->
+      List.exists (fun (_, (t, _, _), _) -> List.exists (fun (_, a) -> nested a) (transform_case_args t)) cases
+    | InstD (_, _, {it = StructT fields; _}) ->
+      List.exists (fun (_, (t, _, _), _) -> nested t) fields
+    | _ -> false) typds
+
+let classical_instances def =
+  String.concat "" (List.filter_map (fun (id, inst) ->
+    if not (StringSet.mem id !classical_eq_types) then None else
+    let InstD (binds, _, _) = inst.it in
+    Some ("\n\nnoncomputable instance" ^ render_binders binds ^ " : DecidableEq " ^
+      parens (render_id id ^ render_binders_ids binds) ^ " :=\n  fun a b => Classical.propDecidable (a = b)"))
+    (group_typds def))
+
 let render_record id binds fields = 
   let constructor_name = "MK" ^ id in
   let inhabitance_binders = render_binders binds in 
@@ -509,7 +570,7 @@ let render_record id binds fields =
   String.concat "\n  " (List.map (fun (a, (typ, _, _), _) ->
     render_atom a ^ " : " ^ render_type RHS typ) fields) ^ "\n" ^
 
-  "deriving Inhabited, BEq\n\n" ^
+  deriving_clause id ^ "\n\n" ^
 
   (* Append instance *)
   "def _append_" ^ id ^ inhabitance_binders ^ " (arg1 arg2 : " ^ parens (id ^ binders) ^ ") : " ^ render_id id ^ " where" ^ 
@@ -538,7 +599,7 @@ let render_variant_typ id binds cases =
   String.concat "\n  " (List.map (fun (m, (t, _, _), _) ->
     "| " ^ render_mixop m ^ render_case_typs t ^ " : " ^ render_id id ^ render_binders_ids binds   
   )  cases) ^ 
-  "\nderiving Inhabited, BEq\n"
+  "\n" ^ deriving_clause id ^ "\n"
 
 let clauses_have_same_args c1 c2 =
   match (c1.it, c2.it) with
@@ -766,6 +827,7 @@ let rec string_of_def def =
 let exported_string = {|/- Preamble -/
 set_option autoImplicit false
 set_option linter.unusedVariables false
+noncomputable section
 set_option match.ignoreUnusedAlts true
 
 instance {a : Type} : Append (Option a) where
@@ -819,6 +881,11 @@ let rec prune_def def =
 
 let string_of_script (il : script) =
   env_ref := Il.Env.env_of_script il;
-  exported_string ^ 
+  let defs = List.filter_map prune_def il in
+  classical_eq_types := List.fold_left (fun acc d ->
+    let typds = group_typds d in
+    if is_nested_group typds then List.fold_left (fun acc (id, _) -> StringSet.add id acc) acc typds
+    else acc) StringSet.empty defs;
+  exported_string ^
   "/- Generated Code -/\n\n" ^
-  String.concat "\n\n" (List.filter_map prune_def il |> List.map string_of_def)
+  String.concat "\n\n" (List.map (fun d -> string_of_def d ^ classical_instances d) defs)
