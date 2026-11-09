@@ -283,7 +283,15 @@ and render_exp exp_type exp =
   | ExtE (e1, p, e2) -> render_path_start p e1 true e2
   | CallE (id, args) -> parens (render_id id.it ^ " " ^ String.concat " " (List.map (render_arg exp_type) args))
   (* Iter handling *)
-  | IterE (e, (ListN (n, _), [])) -> parens ("List.replicate " ^ (r_func n) ^ " " ^ (r_func e)) 
+  (* `e^(i<n){x <- xs}` is the list of `e` at `i = 0, ..., n-1`, where `x` is `xs[i]`. *)
+  | IterE (e, (ListN (n, Some i), iter_binds)) when exp_type <> LHS ->
+    let body = match e.it with
+      | CaseE _ -> parens (r_func e ^ " : " ^ render_type RHS e.note)
+      | _ -> r_func e
+    in
+    parens (parens ("List.range " ^ r_func n) ^ ".map " ^
+      render_lambda [parens (render_id i.it ^ " : Nat")] (render_index_lets i iter_binds body))
+  | IterE (e, (ListN (n, _), [])) -> parens ("List.replicate " ^ (r_func n) ^ " " ^ (r_func e))
   | IterE (e, (_, [])) -> r_func e
   | IterE (e, _) when exp_type = LHS -> r_func e
   | IterE (e, (iter, iter_binds)) ->
@@ -306,6 +314,12 @@ and render_exp exp_type exp =
   | SubE _ -> error exp.at "Encountered subtype expression. Please run sub pass"
   | IfE (cond, then_exp, else_exp) -> 
     parens ("if " ^ r_func cond ^ " then " ^ r_func then_exp ^ " else " ^ r_func else_exp)
+
+(* `let x : T := xs[i]!; text` for every binder `x <- xs` of an indexed iteration. *)
+and render_index_lets i iter_binds text =
+  List.fold_right (fun (id, e) acc ->
+    "let " ^ render_id id.it ^ " : " ^ render_type RHS (remove_iter_from_type e.note) ^ " := " ^
+    parens (render_exp RHS e) ^ "[" ^ render_id i.it ^ "]!; " ^ acc) iter_binds text
 
 and render_arg exp_type a = 
   match a.it with 
@@ -460,6 +474,10 @@ let rec render_prem prem =
     string_of_list_prefix " " " " (render_exp REL) (transform_case_tup exp))
   | NegPr p -> parens ("¬" ^ r_func p)
   | ElsePr -> "True " ^ comment_parens ("Unsupported premise: otherwise") (* Will be removed by an else pass *)
+  (* `p^(i<n){x <- xs}` holds when `p` holds at every `i < n`, where `x` is `xs[i]`. *)
+  | IterPr (p, (ListN (n, Some i), ps)) ->
+    parens ("∀ " ^ parens (render_id i.it ^ " : Nat") ^ ", " ^ render_id i.it ^ " < " ^
+      render_exp REL n ^ " → " ^ render_index_lets i ps (r_func p))
   | IterPr (p, (_, [])) -> r_func p
   | IterPr (p, (iter, ps)) -> 
     let option_conversion s = if iter = Opt then parens ("Option.toList " ^ s) else s in
@@ -559,6 +577,43 @@ let render_function_def id params r_typ clauses =
   ) groups) ^
   "\n"
 
+(* The length premises of the iterations in a rule: every binder of `e^n` has length `n`,
+   and the binders of one iteration have equal lengths (equal shape for `?`). A premise is
+   emitted only when the rule quantifies every variable that it mentions. *)
+let iter_length_prems quants exp prems =
+  let acc = ref [] in
+  let module Arg = struct
+    include Il.Iter.Skip
+    let add es s = acc := (es, s) :: !acc
+    let len e = parens ("List.length " ^ render_exp REL e)
+    let record iter binds =
+      let exps = List.map snd binds in
+      match iter, exps with
+      | ListN (n, _), _ ->
+        List.iter (fun e -> add [n; e] (parens (len e ^ " = " ^ render_exp REL n))) exps
+      | (List | List1), e0 :: rest ->
+        List.iter (fun e -> add [e0; e] (parens (len e0 ^ " = " ^ len e))) rest
+      | Opt, e0 :: rest ->
+        List.iter (fun e -> add [e0; e] (parens (parens (render_exp REL e0) ^ ".isSome = " ^
+          parens (render_exp REL e) ^ ".isSome"))) rest
+      | _, [] -> ()
+    let visit_exp e = match e.it with
+      | IterE (_, (iter, binds)) -> record iter binds
+      | _ -> ()
+    let visit_prem p = match p.it with
+      | IterPr (_, (iter, binds)) -> record iter binds
+      | _ -> ()
+  end in
+  let module It = Il.Iter.Make(Arg) in
+  It.exp exp;
+  It.prems prems;
+  let bound = (Il.Free.bound_quants quants).Il.Free.varid in
+  let closed e = Il.Free.Set.subset (Il.Free.free_exp e).Il.Free.varid bound in
+  List.rev !acc
+  |> List.filter (fun (es, _) -> List.for_all closed es)
+  |> List.map snd
+  |> List.fold_left (fun seen s -> if List.mem s seen then seen else seen @ [s]) []
+
 let render_relation id params typ rules =
   "inductive " ^ id ^ render_params params ^ " : " ^ string_of_relation_args typ ^ "Prop where\n  " ^
   String.concat "\n  " (List.map (fun rule -> match rule.it with
@@ -566,6 +621,8 @@ let render_relation id params typ rules =
       let string_prems = string_of_list "\n    " " ->\n    " " ->\n    " (render_prem) prems in
       let param_ids = List.map get_param_id params in
       let quants = List.filter (fun q -> not (List.mem (get_param_id q) param_ids)) (quants @ let_quants prems) in
+      let string_prems = string_prems ^
+        String.concat "" (List.map (fun s -> s ^ " ->\n    ") (iter_length_prems quants exp prems)) in
       let forall_quantifiers = string_of_list "forall " ", " " " (render_quant REL) quants in
       "| " ^ render_id rule_id.it ^ " : " ^ forall_quantifiers ^ string_prems ^ id ^
       string_of_list_prefix " " " " get_param_id params ^ " " ^
@@ -707,17 +764,20 @@ let rec string_of_def def =
   end
 
 let exported_string = {|/- Preamble -/
+set_option autoImplicit false
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
-instance : Append (Option a) where
+instance {a : Type} : Append (Option a) where
   append := fun o1 o2 => match o1 with | none => o2 | _ => o1
     
-def Forall (R : α → Prop) (xs : List α) : Prop :=
+def Forall {α : Type} (R : α → Prop) (xs : List α) : Prop :=
   ∀ x ∈ xs, R x
-def Forall₂ (R : α → β → Prop) (xs : List α) (ys : List β) : Prop :=
+/- `Forall₂` and `Forall₃` relate the elements at equal positions. The rules that use them
+   carry the premises that the lists have equal lengths. -/
+def Forall₂ {α β : Type} (R : α → β → Prop) (xs : List α) (ys : List β) : Prop :=
   ∀ x y, (x,y) ∈ List.zip xs ys → R x y
-def Forall₃ (R : α → β → γ → Prop) (xs : List α) (ys : List β) (zs : List γ) : Prop :=
+def Forall₃ {α β γ : Type} (R : α → β → γ → Prop) (xs : List α) (ys : List β) (zs : List γ) : Prop :=
   ∀ x y z, (x,y,z) ∈ List.zip xs (List.zip ys zs) → R x y z
     
 macro "opaqueDef" : term => `(by first | exact Inhabited.default | (intros; exact Inhabited.default) | (intros; assumption))
@@ -733,16 +793,16 @@ def setminus_ (X : Type) [BEq X] (l1 l2 : List X) : List X :=
 
 /- Sequence primitives: `s[i] = .. f` updates element `i` with `f`, `s[i : j] = bs`
    replaces the `j` elements from `i` with `bs`. -/
-def list_update_func (l : List α) (i : Nat) (f : α → α) : List α := l.modify i f
-def list_slice_update (l : List α) (i j : Nat) (bs : List α) : List α :=
+def list_update_func {α : Type} (l : List α) (i : Nat) (f : α → α) : List α := l.modify i f
+def list_slice_update {α : Type} (l : List α) (i j : Nat) (bs : List α) : List α :=
   l.take i ++ bs ++ l.drop (i + j)
-def list_map3 (f : α → β → γ → δ) : List α → List β → List γ → List δ
+def list_map3 {α β γ δ : Type} (f : α → β → γ → δ) : List α → List β → List γ → List δ
   | a :: as, b :: bs, c :: cs => f a b c :: list_map3 f as bs cs
   | _, _, _ => []
-def option_zipWith (f : α → β → γ) : Option α → Option β → Option γ
+def option_zipWith {α β γ : Type} (f : α → β → γ) : Option α → Option β → Option γ
   | some a, some b => some (f a b)
   | _, _ => none
-def option_map3 (f : α → β → γ → δ) : Option α → Option β → Option γ → Option δ
+def option_map3 {α β γ δ : Type} (f : α → β → γ → δ) : Option α → Option β → Option γ → Option δ
   | some a, some b, some c => some (f a b c)
   | _, _, _ => none
 |}
