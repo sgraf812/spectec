@@ -547,14 +547,24 @@ let rec filter_return_prems all_prems prems =
   | p :: ps when pred p all_prems -> p :: filter_return_prems all_prems ps
   | _ :: ps -> filter_return_prems all_prems ps
 
-let generate_matching_rules env args tupt r = 
+(* The rule of `before` for an earlier rule `r` that can match `args`. An undecidable match
+   counts as a possible match. The rule leaves out the exclusions of `r` by its own earlier
+   rules: some earlier rule applies exactly when some earlier rule matches with its premises,
+   because the first such rule applies. *)
+let generate_matching_rules env before_prefix args tupt r =
   match r.it with
-  | RuleD (id, quants, mixop, exp', prems) -> 
+  | RuleD (id, quants, mixop, exp', prems) ->
     let (args', _) = Lib.List.split_last (get_tuple_exp exp') in
     let new_exp = TupE args' $$ exp'.at % tupt in
-    (try Eval.match_list Eval.match_exp env.il_env Subst.empty args' args with Eval.Irred -> None) |>
-    Option.map (fun _ -> 
-      {r with it = RuleD (id, quants, tail_mixop mixop, new_exp, filter_return_prems prems prems)}
+    let is_exclusion p = match p.it with
+      | NegPr {it = RulePr (id', _, _, _); _} -> String.starts_with ~prefix:before_prefix id'.it
+      | _ -> false
+    in
+    let prems' = Lib.List.filter_not is_exclusion (filter_return_prems prems prems) in
+    (try Eval.match_list Eval.match_exp env.il_env Subst.empty args' args
+     with Eval.Irred -> Some Subst.empty) |>
+    Option.map (fun _ ->
+      {r with it = RuleD (id, quants, tail_mixop mixop, new_exp, prems')}
     )
 
 let is_otherwise prem =
@@ -572,8 +582,8 @@ let fall_through_prems env id mixop typs rules =
     let (args, _) = Lib.List.split_last (get_tuple_exp exp) in
     let (typs', _) = Lib.List.split_last typs in
     let tupt = TupT typs' $ id.at in
-    let rules' = 
-      List.filter_map (generate_matching_rules env args tupt) prev_rules
+    let rules' =
+      List.filter_map (generate_matching_rules env (id.it ^ "_before_") args tupt) prev_rules
     in
     let prems' = List.filter (fun p -> p.it <> ElsePr) prems in
     if rules' = [] then go ({ r with it = RuleD (rid, quants, m, exp, prems') } :: prev_rules) rs else

@@ -84,17 +84,25 @@ let rec t_clause_group_to_expr (clauses : clause list) : exp option =
         | None -> None
         | Some else_exp -> Some (mk_if cond rhs else_exp)
 
-let t_clause_group (clauses : clause list) : clause list =
+(* A group of one clause stays as it is: its `otherwise` refers to the clauses of earlier
+   groups. A merged group keeps its final `otherwise` when an earlier group exists. *)
+let t_clause_group (first : bool) (clauses : clause list) : clause list =
+  match clauses with
+  | [_] -> clauses
+  | _ ->
   match t_clause_group_to_expr clauses with
   | None -> clauses
-  | Some exp -> 
+  | Some exp ->
     let rep = List.hd clauses in
     let DefD (quants, args, _rhs, _prems) = rep.it in
-    [{ rep with it = DefD (quants, args, exp, []) }]
+    let last = List.nth clauses (List.length clauses - 1) in
+    let prems = if not first && has_only_else_premise last then [ElsePr $ rep.at] else [] in
+    [{ rep with it = DefD (quants, args, exp, prems) }]
 
 
 let t_clauses clauses =
-  List.concat_map t_clause_group (group_clauses_by_same_args clauses)
+  List.concat (List.mapi (fun i group -> t_clause_group (i = 0) group)
+    (group_clauses_by_same_args clauses))
 
 let rec t_def (def : def) : def = { def with it = t_def' def.it }
 and t_def' = function
