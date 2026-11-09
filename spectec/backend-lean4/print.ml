@@ -235,6 +235,9 @@ and render_exp exp_type exp =
   | NumE (`Real n) -> parens (string_of_float n ^ " : Real")
   | TextE s -> "\"" ^ String.escaped s ^ "\""
   | UnE (unop, _, e1) -> parens (render_unop unop ^ r_func e1)
+  (* IL `int` division and remainder truncate towards zero (`Z.div`, `Z.rem`). *)
+  | BinE (`DivOp, `IntT, e1, e2) -> parens ("Int.tdiv " ^ r_func e1 ^ " " ^ r_func e2)
+  | BinE (`ModOp, `IntT, e1, e2) -> parens ("Int.tmod " ^ r_func e1 ^ " " ^ r_func e2)
   | BinE (binop, _, e1, e2) -> parens (r_func e1 ^ render_binop binop ^ r_func e2)
   | CmpE (cmpop, _, e1, e2) -> parens (r_func e1 ^ render_cmpop cmpop ^ r_func e2)
   | TupE [] -> "()"
@@ -675,6 +678,67 @@ let iter_length_prems quants exp prems =
   |> List.map snd
   |> List.fold_left (fun seen s -> if List.mem s seen then seen else seen @ [s]) []
 
+(* The definedness premises of a rule. The IL operators below are partial (`Xl.Num.bin`,
+   `Xl.Num.cvt`), and the printed Lean operators are total, so every rule states the domain
+   condition of each such application: `nat` subtraction, exact `nat`/`int` division,
+   division and remainder by a nonzero divisor, downward numeric conversions, and slices and
+   updates within the bounds of their list. The conditions of an `if` branch and of the right
+   operand of `\/` and `->` hold only conditionally, so the traversal leaves them out. A
+   premise is emitted only when the rule quantifies every variable that it mentions. *)
+let definedness_prems quants exp prems =
+  let r = render_exp REL in
+  let len e = parens ("List.length " ^ r e) in
+  let rec path_exps p = match p.it with
+    | RootP -> []
+    | IdxP (p', e) -> e :: path_exps p'
+    | SliceP (p', e1, e2) -> e1 :: e2 :: path_exps p'
+    | DotP (p', _) -> path_exps p'
+  in
+  let root_bound e1 p = match p.it with
+    | IdxP ({it = RootP; _}, i) -> [([e1; i], parens (r i ^ " < " ^ len e1))]
+    | SliceP ({it = RootP; _}, i, j) -> [([e1; i; j], parens (r i ^ " + " ^ r j ^ " ≤ " ^ len e1))]
+    | _ -> []
+  in
+  let rec go e =
+    let sub = List.concat_map go in
+    match e.it with
+    | VarE _ | BoolE _ | NumE _ | TextE _ -> []
+    | IfE (c, _, _) -> go c
+    | BinE ((`OrOp | `ImplOp), _, e1, _) -> go e1
+    | BinE (`SubOp, `NatT, e1, e2) -> ([e1; e2], parens (r e2 ^ " ≤ " ^ r e1)) :: sub [e1; e2]
+    | BinE (`DivOp, (`NatT | `IntT), e1, e2) ->
+      ([e1; e2], parens (r e2 ^ " ≠ 0 ∧ " ^ r e1 ^ " % " ^ r e2 ^ " = 0")) :: sub [e1; e2]
+    | BinE ((`DivOp | `ModOp), _, e1, e2) -> ([e2], parens (r e2 ^ " ≠ 0")) :: sub [e1; e2]
+    | CvtE (e1, `IntT, `NatT) -> ([e1], parens ("0 ≤ " ^ r e1)) :: go e1
+    | CvtE (e1, `RatT, `IntT) -> ([e1], parens (parens (r e1) ^ ".den = 1")) :: go e1
+    | CvtE (e1, `RatT, `NatT) ->
+      ([e1], parens (parens (r e1) ^ ".den = 1 ∧ 0 ≤ " ^ r e1)) :: go e1
+    | SliceE (e1, e2, e3) -> ([e1; e2; e3], parens (r e2 ^ " + " ^ r e3 ^ " ≤ " ^ len e1)) :: sub [e1; e2; e3]
+    | UpdE (e1, p, e2) | ExtE (e1, p, e2) -> root_bound e1 p @ sub (e1 :: e2 :: path_exps p)
+    | UnE (_, _, e1) | ProjE (e1, _) | CaseE (_, e1) | UncaseE (e1, _) | OptE (Some e1)
+    | TheE e1 | DotE (e1, _) | LiftE e1 | LenE e1 | CvtE (e1, _, _) | SubE (e1, _, _) -> go e1
+    | OptE None -> []
+    | BinE (_, _, e1, e2) | CmpE (_, _, e1, e2) | CompE (e1, e2) | MemE (e1, e2)
+    | CatE (e1, e2) | IdxE (e1, e2) -> sub [e1; e2]
+    | TupE es | ListE es -> sub es
+    | StrE fields -> sub (List.map snd fields)
+    | CallE (_, args) -> sub (List.filter_map (fun a -> match a.it with ExpA e -> Some e | _ -> None) args)
+    | IterE (_, (_, binds)) -> sub (List.map snd binds)
+  in
+  let go_prem p = match p.it with
+    | IfPr e -> go e
+    | RulePr (_, _, _, e) -> go e
+    | LetPr (_, _, e) -> go e
+    | IterPr (_, (_, binds)) -> List.concat_map go (List.map snd binds)
+    | NegPr _ | ElsePr -> []
+  in
+  let bound = (Il.Free.bound_quants quants).Il.Free.varid in
+  let closed e = Il.Free.Set.subset (Il.Free.free_exp e).Il.Free.varid bound in
+  (go exp @ List.concat_map go_prem prems)
+  |> List.filter (fun (es, _) -> List.for_all closed es)
+  |> List.map snd
+  |> List.fold_left (fun seen s -> if List.mem s seen then seen else seen @ [s]) []
+
 let render_relation id params typ rules =
   "inductive " ^ id ^ render_params params ^ " : " ^ string_of_relation_args typ ^ "Prop where\n  " ^
   String.concat "\n  " (List.map (fun rule -> match rule.it with
@@ -683,7 +747,8 @@ let render_relation id params typ rules =
       let param_ids = List.map get_param_id params in
       let quants = List.filter (fun q -> not (List.mem (get_param_id q) param_ids)) (quants @ let_quants prems) in
       let string_prems = string_prems ^
-        String.concat "" (List.map (fun s -> s ^ " ->\n    ") (iter_length_prems quants exp prems)) in
+        String.concat "" (List.map (fun s -> s ^ " ->\n    ")
+          (iter_length_prems quants exp prems @ definedness_prems quants exp prems)) in
       let forall_quantifiers = string_of_list "forall " ", " " " (render_quant REL) quants in
       "| " ^ render_id rule_id.it ^ " : " ^ forall_quantifiers ^ string_prems ^ id ^
       string_of_list_prefix " " " " get_param_id params ^ " " ^
