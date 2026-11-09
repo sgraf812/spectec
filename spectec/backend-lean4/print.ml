@@ -755,10 +755,15 @@ let render_relation id params typ rules =
       String.concat " " (List.map (render_exp REL) (transform_case_tup exp))
   ) rules)
 
+(* A function without a printable definition is an opaque constant, unless `Builtins` defines
+   it by hand. *)
 let render_axiom id params r_typ =
-  "opaque " ^ render_id id.it ^ " : " ^
-    string_of_list "forall " ", " " " (render_param RHS) params ^
-    render_type RHS r_typ ^ " := opaqueDef"
+  let signature = string_of_list "forall " ", " " " (render_param RHS) params ^ render_type RHS r_typ in
+  match List.assoc_opt id.it Builtins.bodies with
+  | Some body ->
+    comment_parens "Hand-written definition, see `Builtins` in the preamble" ^ "\n" ^
+    "def " ^ render_id id.it ^ " : " ^ signature ^ " :=\n  " ^ body
+  | None -> "opaque " ^ render_id id.it ^ " : " ^ signature ^ " := opaqueDef"
 
 let render_rel_axiom id typ =
   "opaque " ^ id.it ^ " : " ^ string_of_relation_args typ ^ "Prop"
@@ -954,6 +959,6 @@ let string_of_script (il : script) =
     let typds = group_typds d in
     if is_nested_group typds then List.fold_left (fun acc (id, _) -> StringSet.add id acc) acc typds
     else acc) StringSet.empty defs;
-  exported_string ^
+  exported_string ^ Builtins.prelude ^
   "/- Generated Code -/\n\n" ^
   String.concat "\n\n" (List.map (fun d -> string_of_def d ^ classical_instances d) defs)
