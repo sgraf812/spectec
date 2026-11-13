@@ -682,9 +682,13 @@ let iter_length_prems quants exp prems =
    `Xl.Num.cvt`), and the printed Lean operators are total, so every rule states the domain
    condition of each such application: `nat` subtraction, exact `nat`/`int` division,
    division and remainder by a nonzero divisor, downward numeric conversions, and slices and
-   updates within the bounds of their list. The conditions of an `if` branch and of the right
-   operand of `\/` and `->` hold only conditionally, so the traversal leaves them out. A
-   premise is emitted only when the rule quantifies every variable that it mentions. *)
+   updates within the bounds of their list, at every index and slice along an update path.
+   A call to a definition by one unconditional clause over variables is defined where the
+   clause body is defined, so the rule also states the conditions of the body, with the
+   arguments for the parameters; inside such a body, an index lies within its list as well.
+   The conditions of an `if` branch and of the right operand of `\/` and `->` hold only
+   conditionally, so the traversal leaves them out. A premise is emitted only when the rule
+   quantifies every variable that it mentions. *)
 let definedness_prems quants exp prems =
   let r = render_exp REL in
   let len e = parens ("List.length " ^ r e) in
@@ -694,47 +698,79 @@ let definedness_prems quants exp prems =
     | SliceP (p', e1, e2) -> e1 :: e2 :: path_exps p'
     | DotP (p', _) -> path_exps p'
   in
-  let root_bound e1 p = match p.it with
-    | IdxP ({it = RootP; _}, i) -> [([e1; i], parens (r i ^ " < " ^ len e1))]
-    | SliceP ({it = RootP; _}, i, j) -> [([e1; i; j], parens (r i ^ " + " ^ r j ^ " ≤ " ^ len e1))]
+  (* The value that the path `p` selects in `e1`. *)
+  let rec path_value e1 p = match p.it with
+    | RootP -> Some e1
+    | DotP (p', atom) ->
+      Option.map (fun v -> {it = DotE (v, atom); at = p.at; note = p.note}) (path_value e1 p')
+    | IdxP (p', i) ->
+      Option.map (fun v -> {it = IdxE (v, i); at = p.at; note = p.note}) (path_value e1 p')
+    | SliceP _ -> None
+  in
+  let rec path_bounds e1 p =
+    let bound p' cond = match path_value e1 p' with
+      | Some v -> [(e1 :: path_exps p, parens (cond (len v)))]
+      | None -> []
+    in
+    match p.it with
+    | RootP -> []
+    | DotP (p', _) -> path_bounds e1 p'
+    | IdxP (p', i) -> path_bounds e1 p' @ bound p' (fun l -> r i ^ " < " ^ l)
+    | SliceP (p', i, j) -> path_bounds e1 p' @ bound p' (fun l -> r i ^ " + " ^ r j ^ " ≤ " ^ l)
+  in
+  let exp_args args = List.filter_map (fun a -> match a.it with ExpA e -> Some e | _ -> None) args in
+  let inline_call seen go_body f args =
+    if List.mem f.it seen then [] else
+    match Il.Env.find_opt_def !env_ref f with
+    | Some (_, _, [{it = DefD (_, pargs, body, []); _}]) when List.length pargs = List.length args ->
+      let s = List.fold_left2 (fun s parg arg -> match s, parg.it, arg.it with
+          | Some s, ExpA {it = VarE x; _}, ExpA e -> Some (Il.Subst.add_varid s x e)
+          | _ -> None) (Some Il.Subst.empty) pargs args in
+      (match s with
+       | Some s -> go_body (f.it :: seen) (Il.Subst.subst_exp s body)
+       | None -> [])
     | _ -> []
   in
-  let rec go e =
-    let sub = List.concat_map go in
+  let rec go seen in_def e =
+    let sub = List.concat_map (go seen in_def) in
+    let go1 = go seen in_def in
     match e.it with
     | VarE _ | BoolE _ | NumE _ | TextE _ -> []
-    | IfE (c, _, _) -> go c
-    | BinE ((`OrOp | `ImplOp), _, e1, _) -> go e1
+    | IfE (c, _, _) -> go1 c
+    | BinE ((`OrOp | `ImplOp), _, e1, _) -> go1 e1
     | BinE (`SubOp, `NatT, e1, e2) -> ([e1; e2], parens (r e2 ^ " ≤ " ^ r e1)) :: sub [e1; e2]
     | BinE (`DivOp, (`NatT | `IntT), e1, e2) ->
       ([e1; e2], parens (r e2 ^ " ≠ 0 ∧ " ^ r e1 ^ " % " ^ r e2 ^ " = 0")) :: sub [e1; e2]
     | BinE ((`DivOp | `ModOp), _, e1, e2) -> ([e2], parens (r e2 ^ " ≠ 0")) :: sub [e1; e2]
-    | CvtE (e1, `IntT, `NatT) -> ([e1], parens ("0 ≤ " ^ r e1)) :: go e1
-    | CvtE (e1, `RatT, `IntT) -> ([e1], parens (parens (r e1) ^ ".den = 1")) :: go e1
+    | CvtE (e1, `IntT, `NatT) -> ([e1], parens ("0 ≤ " ^ r e1)) :: go1 e1
+    | CvtE (e1, `RatT, `IntT) -> ([e1], parens (parens (r e1) ^ ".den = 1")) :: go1 e1
     | CvtE (e1, `RatT, `NatT) ->
-      ([e1], parens (parens (r e1) ^ ".den = 1 ∧ 0 ≤ " ^ r e1)) :: go e1
+      ([e1], parens (parens (r e1) ^ ".den = 1 ∧ 0 ≤ " ^ r e1)) :: go1 e1
     | SliceE (e1, e2, e3) -> ([e1; e2; e3], parens (r e2 ^ " + " ^ r e3 ^ " ≤ " ^ len e1)) :: sub [e1; e2; e3]
-    | UpdE (e1, p, e2) | ExtE (e1, p, e2) -> root_bound e1 p @ sub (e1 :: e2 :: path_exps p)
+    | UpdE (e1, p, e2) | ExtE (e1, p, e2) -> path_bounds e1 p @ sub (e1 :: e2 :: path_exps p)
+    | IdxE (e1, e2) when in_def -> ([e1; e2], parens (r e2 ^ " < " ^ len e1)) :: sub [e1; e2]
     | UnE (_, _, e1) | ProjE (e1, _) | CaseE (_, e1) | UncaseE (e1, _) | OptE (Some e1)
-    | TheE e1 | DotE (e1, _) | LiftE e1 | LenE e1 | CvtE (e1, _, _) | SubE (e1, _, _) -> go e1
+    | TheE e1 | DotE (e1, _) | LiftE e1 | LenE e1 | CvtE (e1, _, _) | SubE (e1, _, _) -> go1 e1
     | OptE None -> []
     | BinE (_, _, e1, e2) | CmpE (_, _, e1, e2) | CompE (e1, e2) | MemE (e1, e2)
     | CatE (e1, e2) | IdxE (e1, e2) -> sub [e1; e2]
     | TupE es | ListE es -> sub es
     | StrE fields -> sub (List.map snd fields)
-    | CallE (_, args) -> sub (List.filter_map (fun a -> match a.it with ExpA e -> Some e | _ -> None) args)
+    | CallE (f, args) ->
+      sub (exp_args args) @ inline_call seen (fun seen' body -> go seen' true body) f args
     | IterE (_, (_, binds)) -> sub (List.map snd binds)
   in
+  let go_top = go [] false in
   let go_prem p = match p.it with
-    | IfPr e -> go e
-    | RulePr (_, _, _, e) -> go e
-    | LetPr (_, _, e) -> go e
-    | IterPr (_, (_, binds)) -> List.concat_map go (List.map snd binds)
+    | IfPr e -> go_top e
+    | RulePr (_, _, _, e) -> go_top e
+    | LetPr (_, _, e) -> go_top e
+    | IterPr (_, (_, binds)) -> List.concat_map go_top (List.map snd binds)
     | NegPr _ | ElsePr -> []
   in
   let bound = (Il.Free.bound_quants quants).Il.Free.varid in
   let closed e = Il.Free.Set.subset (Il.Free.free_exp e).Il.Free.varid bound in
-  (go exp @ List.concat_map go_prem prems)
+  (go_top exp @ List.concat_map go_prem prems)
   |> List.filter (fun (es, _) -> List.for_all closed es)
   |> List.map snd
   |> List.fold_left (fun seen s -> if List.mem s seen then seen else seen @ [s]) []
