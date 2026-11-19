@@ -196,6 +196,21 @@ type item =
   | Prem of prem
   | Str of string              (* a decidable proposition over bound variables *)
 
+(* The calls of the rule under construction, by their rendering, with the name of their output. *)
+let calls : (string, string) Hashtbl.t = Hashtbl.create 16
+
+(* The argument `e` with the binders of its iterations renamed to one name, so that two calls
+   that differ only in those names have the same key. *)
+let rec canon (e : exp) : exp = match e.it with
+  | IterE (e1, (it, [ (v, xs) ])) ->
+    let v' = { v with it = "it_" } in
+    let s = Il.Subst.add_varid Il.Subst.empty v (mkvar e1 "it_") in
+    { e with it = IterE (canon (Il.Subst.subst_exp s e1), (it, [ (v', canon xs) ])) }
+  | TupE es -> { e with it = TupE (List.map canon es) }
+  | CallE (f, args) -> { e with it = CallE (f, List.map (fun a -> match a.it with
+      | ExpA e' -> { a with it = ExpA (canon e') } | _ -> a) args) }
+  | _ -> e
+
 let hyp = ref 0
 let fresh_h () = incr hyp; "h_" ^ string_of_int !hyp
 
@@ -264,6 +279,12 @@ let candidates_of (f : id) : string option =
     r
 
 let typed (e : exp) = parens (render_exp REL e ^ " : " ^ render_type REL e.note)
+
+(* Bind the variable `x` to the value of `e`, with the proof `h : e = x`. A lambda keeps `x` a
+   local variable rather than a `let`, so that `subst_vars` can eliminate it. *)
+let bind_var h (x : id) (e : exp) body =
+  "((fun (" ^ render_id x.it ^ " : " ^ render_type REL e.note ^ ") (" ^ h ^ " : " ^ typed e ^ " = " ^
+  render_id x.it ^ ") => (" ^ body ^ ")) " ^ typed e ^ " rfl)"
 
 (* An equation `Option.get! (f c) = y` with `c` unbound and `y` known, in either orientation. *)
 let candidate_call bound (e1 : exp) (e2 : exp) : (id * string * exp) option =
@@ -361,12 +382,10 @@ and step_prem bound h (p : prem) rest leaf : string option =
   match p.it with
   | IfPr ({ it = CmpE (`EqOp, _, { it = VarE x; _ }, e2); _ })
     when not (SS.mem x.it bound) && closed bound (fv_exp e2) ->
-    Some ("(match " ^ h ^ " : " ^ typed e2 ^ " with\n | " ^ render_id x.it ^ " => (" ^
-      compile (SS.add x.it bound) rest leaf ^ "))")
+    Some (bind_var h x e2 (compile (SS.add x.it bound) rest leaf))
   | IfPr ({ it = CmpE (`EqOp, _, e1, { it = VarE x; _ }); _ })
     when not (SS.mem x.it bound) && closed bound (fv_exp e1) ->
-    Some ("(match " ^ h ^ " : " ^ typed e1 ^ " with\n | " ^ render_id x.it ^ " => (" ^
-      compile (SS.add x.it bound) rest leaf ^ "))")
+    Some (bind_var h x e1 (compile (SS.add x.it bound) rest leaf))
   | IfPr ({ it = CmpE (`EqOp, _, e1, e2); _ }) when
       (match candidate_call bound e1 e2 with Some _ -> true | None -> false) ->
     let (f, c, y) = Option.get (candidate_call bound e1 e2) in
@@ -404,10 +423,19 @@ and step_prem bound h (p : prem) rest leaf : string option =
       match outs with
       | [] -> Some ("(" ^ call ^ ".flatMap fun ⟨_, " ^ h ^ "⟩ => (" ^ compile bound rest leaf ^ "))")
       | [ o ] ->
-        let ov = fresh "o" in
-        Some ("(" ^ call ^ ".flatMap fun ⟨" ^ ov ^ ", " ^ h ^ "⟩ => " ^
-          match_value bound ov o (fun bound' ds ->
-            compile bound' (List.map (fun (y, e) -> Eq (y, e)) ds @ rest) leaf) ^ ")")
+        (* A call with the same relation and inputs as an earlier one has the same output, so it
+           reuses the output of the earlier call, whose proof proves both premises. *)
+        let key = String.concat " " (fun_name id.it m :: List.map (fun a -> parens (render_exp REL (canon a))) ins) in
+        (match Hashtbl.find_opt calls key with
+         | Some ov ->
+           Some (match_value bound ov o (fun bound' ds ->
+             compile bound' (List.map (fun (y, e) -> Eq (y, e)) ds @ rest) leaf))
+         | None ->
+           let ov = fresh "o" in
+           Hashtbl.add calls key ov;
+           Some ("(" ^ call ^ ".flatMap fun ⟨" ^ ov ^ ", " ^ h ^ "⟩ => " ^
+             match_value bound ov o (fun bound' ds ->
+               compile bound' (List.map (fun (y, e) -> Eq (y, e)) ds @ rest) leaf) ^ ")"))
       | _ -> None
     end
   | RulePr _ -> unsupported "relation with arguments"
@@ -442,13 +470,14 @@ and checker (p : prem) : string = match p.it with
   | _ -> unsupported "iterated premise %s" (render_prem p)
 
 let leaf_tactic rule_name =
-  "by subst_vars; apply " ^ rule_name ^ " <;> first | assumption | rfl | (apply Eq.symm; assumption) | exact default | (and_intros <;> first | assumption | rfl | (apply Eq.symm; assumption))"
+  "by subst_vars; first | (apply " ^ rule_name ^ " <;> first | assumption | rfl | (apply Eq.symm; assumption) | exact default | (and_intros <;> first | assumption | rfl | (apply Eq.symm; assumption))) | solve_by_elim [" ^ rule_name ^ "]"
 
 (* The function of one rule in one mode. *)
 let compile_rule rel typs (m : mode) (rule : rule) : (string * string, string) result =
   match rule.it with
   | RuleD (rule_id, quants, _, exp, prems) ->
     let fname = fun_name rel m ^ "_" ^ rule_id.it in
+    Hashtbl.reset calls;
     try
       if List.exists (fun q -> match q.it with ExpP _ -> false | _ -> true) quants then
         unsupported "type or definition quantifier";
