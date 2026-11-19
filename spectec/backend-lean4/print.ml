@@ -1085,9 +1085,30 @@ let rec prune_def def =
     | defs' -> Some { def with it = RecD defs' })
   | _ -> Some def
 
+(* Undep states each well-formedness lemma as a relation with one rule and the hint
+   `wf-lemma-func` or `wf-lemma-rel`, whose value says whether the lemma is about an opaque
+   function. The last premise of the rule is the conclusion of the lemma. *)
+let wf_lemmas : (string, bool) Hashtbl.t = Hashtbl.create 64
+
+let rec collect_wf_lemmas (d : def) = match d.it with
+  | HintD { it = RelH (id, hints); _ } ->
+    List.iter (fun (h : hint) ->
+      if h.hintid.it = "wf-lemma-func" || h.hintid.it = "wf-lemma-rel" then
+        Hashtbl.replace wf_lemmas id.it
+          (match h.hintexp.it with El.Ast.BoolE b -> b | _ -> false)) hints
+  | RecD ds -> List.iter collect_wf_lemmas ds
+  | _ -> ()
+
+let is_wf_lemma (d : def) = match d.it with
+  | RelD (id, _, _, _, _) -> Hashtbl.mem wf_lemmas id.it
+  | RecD ds -> ds <> [] && List.for_all (fun d -> match d.it with
+      | RelD (id, _, _, _, _) -> Hashtbl.mem wf_lemmas id.it | _ -> false) ds
+  | _ -> false
+
 let string_of_script (il : script) =
   env_ref := Il.Env.env_of_script il;
-  let defs = List.filter_map prune_def il in
+  List.iter collect_wf_lemmas il;
+  let defs = List.filter (fun d -> not (is_wf_lemma d)) (List.filter_map prune_def il) in
   classical_eq_types := List.fold_left (fun acc d ->
     let typds = group_typds d in
     if not (is_nested_group typds) then acc else
@@ -1100,3 +1121,51 @@ let string_of_script (il : script) =
   exported_string ^ Builtins.prelude ^
   "/- Generated Code -/\n\n" ^
   String.concat "\n\n" (List.map (fun d -> string_of_def d ^ classical_instances d) defs)
+
+(* The well-formedness lemmas, as theorems about the model. A lemma about an opaque function is
+   only stated, as a proposition. The proof introduces the hypotheses, takes apart each
+   function relation among them, and closes each case with `wf_tac`. *)
+let render_wf_lemma id (rule : rule) is_axiom =
+  match rule.it with
+  | RuleD (_, quants, _, exp, prems) ->
+    let quants' = quants @ let_quants prems in
+    let rev = List.rev prems in
+    let concl = List.hd rev and hyps = List.rev (List.tl rev) in
+    let extra = iter_length_prems quants' exp hyps @ definedness_prems quants' exp hyps in
+    let hyp_strs = List.map render_prem hyps @ extra in
+    let names = List.mapi (fun i _ -> "h" ^ string_of_int i) hyp_strs in
+    let statement =
+      string_of_list "∀ " ", " " " (render_quant REL) quants' ^
+      String.concat "" (List.map (fun h -> h ^ " →\n    ") hyp_strs) ^ render_prem concl in
+    if is_axiom then "def " ^ id ^ " : Prop :=\n  " ^ statement else
+    let cases = List.concat (List.mapi (fun i (p : prem) -> match p.it with
+      | RulePr (r, _, _, _) when String.length r.it > 4 && String.sub r.it 0 4 = "fun_" ->
+        [ "h" ^ string_of_int i ]
+      | _ -> []) hyps) in
+    "theorem " ^ id ^ " :\n    " ^ statement ^ " := by\n  intro " ^
+    String.concat " " (List.map (fun q -> get_param_id q |> render_id) quants' @ names) ^ "\n" ^
+    String.concat "" (List.map (fun h -> "  cases " ^ h ^ " <;>\n") cases) ^ "  wf_tac"
+
+let wf_prelude = {|
+set_option linter.unusedVariables false
+
+/-- Closes a goal `wf_T x` once the function relations among the hypotheses are taken apart. -/
+macro "wf_tac" : tactic => `(tactic| (
+  subst_vars
+  first
+    | (simp_all; done)
+    | (repeat' constructor) <;> (first | assumption | (simp_all; done) | omega | decide)
+    | grind))
+|}
+
+let string_of_wf_lemmas (import : string) (il : script) =
+  ignore il;
+  let lemmas = ref [] in
+  let rec go (d : def) = match d.it with
+    | RelD (id, _, _, _, [ rule ]) when Hashtbl.mem wf_lemmas id.it ->
+      lemmas := !lemmas @ [ render_wf_lemma id.it rule (Hashtbl.find wf_lemmas id.it) ]
+    | RecD ds -> List.iter go ds
+    | _ -> ()
+  in
+  List.iter go il;
+  "import " ^ import ^ "\n" ^ wf_prelude ^ "\n" ^ String.concat "\n\n" !lemmas ^ "\n"

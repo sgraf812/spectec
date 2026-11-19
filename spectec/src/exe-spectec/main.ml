@@ -242,7 +242,7 @@ let argspec = Arg.align (
   "--interpreter", Arg.Rest_all (fun args -> target := Interpreter args),
     " Generate interpreter";
   "--rocq", Arg.Unit (fun () -> target := Rocq), " Generate Rocq Inductive Definitions (-o main.v [wf.v]: well-formedness lemmas go to wf.v, default main_wf.v)";
-  "--lean4-import", Arg.Set_string lean4_import, " Lean module that the Lean 4 interpreter file imports (-o main.lean interp.lean)";
+  "--lean4-import", Arg.Set_string lean4_import, " Lean module that the Lean 4 interpreter file imports (-o main.lean interp.lean [wf.lean])";
   "--rocq-namespace", Arg.Set_string rocq_namespace, " Logical path used by the Rocq well-formedness lemma file to import the main file";
   "--lean4", Arg.Unit (fun () -> target := Lean4), " Generate Lean4 specification";
   "--debug", Arg.Unit (fun () -> Backend_interpreter.Debugger.debug := true),
@@ -483,6 +483,14 @@ let () =
         let oc = Out_channel.open_text odst in
         Fun.protect (fun () -> Out_channel.output_string oc code)
           ~finally:(fun () -> Out_channel.close oc)
+      | [odst; idst; wdst] ->
+        let code = Backend_lean4.Print.string_of_script il in
+        let interp = Backend_lean4.Interp.string_of_interp !lean4_import il in
+        let wf = Backend_lean4.Print.string_of_wf_lemmas !lean4_import il in
+        List.iter (fun (dst, text) ->
+          let oc = Out_channel.open_text dst in
+          Fun.protect (fun () -> Out_channel.output_string oc text)
+            ~finally:(fun () -> Out_channel.close oc)) [ (odst, code); (idst, interp); (wdst, wf) ]
       | [odst; idst] ->
         let code = Backend_lean4.Print.string_of_script il in
         let interp = Backend_lean4.Interp.string_of_interp !lean4_import il in
