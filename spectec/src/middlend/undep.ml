@@ -224,6 +224,35 @@ let rec get_wf_pred env (exp, t) =
       let name' = remove_last_char name.it $ name.at in 
       let prems = get_wf_pred env (VarE name' $$ name.at % typ, typ) in
       List.map (fun prem -> IterPr (prem, (iter, [(name', exp')])) $ name.at) prems
+    (* A type with type parameters and one case, such as `list(X) = X* -- if |X*| < 2^32`, has
+       no well-formedness predicate of its own. Its values are well formed if the premises of
+       the case hold and its components are well formed, at the type arguments. *)
+    | VarT (id, args) when args <> [] && List.for_all is_type_arg args ->
+      (match Il.Env.find_opt_typ env.il_env id with
+      | Some (params, [{it = InstD (_, _, {it = VariantT [(m, (case_typ, case_quants, prems), _)]; _}); _}])
+        when List.length params = List.length args && List.for_all is_type_param params ->
+        let s = List.fold_left2 (fun s p a -> match p.it, a.it with
+          | TypP x, TypA t -> Subst.add_typid s x t
+          | _ -> s) Subst.empty params args in
+        let case_typ' = Subst.subst_typ s case_typ in
+        let un = UncaseE (exp', m) $$ exp.at % case_typ' in
+        (* The binder names come from `case_typ`: substitution renames them in `case_typ'`. *)
+        let comps = match case_typ.it, case_typ'.it with
+          | TupT tups, TupT tups' when List.length tups = List.length tups' ->
+            List.mapi (fun i ((x, _), (_, t)) -> (x, ProjE (un, i) $$ exp.at % t, t)) (List.combine tups tups')
+          | _ -> [("_" $ id.at, un, case_typ')]
+        in
+        let s' = List.fold_left (fun s (x, e, _) ->
+          if x.it <> "" && x.it <> "_" then Subst.add_varid s x e else s) s comps in
+        (* A case with one component can name it in its quantifiers instead (`X*`). *)
+        let s' = match comps with
+          | [(_, e, _)] -> List.fold_left (fun s q -> match q.it with
+              | ExpP (x, _) -> Subst.add_varid s x e
+              | _ -> s) s' case_quants
+          | _ -> s' in
+        List.map (Subst.subst_prem s') prems @
+        List.concat_map (fun (_, e, t) -> get_wf_pred env (e, t)) comps
+      | _ -> [])
     | TupT exp_typ_pairs -> 
       let prems = 
         List.mapi (fun idx (_, typ) -> 
@@ -689,6 +718,16 @@ let rec t_def env def =
   | RecD defs -> 
     if List.exists (needs_wfness env) defs 
       then List.iter (fun d -> bind_wf_set env (get_def_id d).it) defs; 
+    (* A type of the group can need well-formedness because of a type later in the group, so
+       the set of types with a predicate is the least fixpoint over the group. *)
+    let rec fix () =
+      let before = env.wf_set in
+      List.iter (fun d -> match d.it with
+        | TypD (id, _, [inst]) -> ignore (create_well_formed_predicate env id inst)
+        | _ -> ()) defs;
+      if not (StringSet.equal before env.wf_set) then fix ()
+    in
+    fix ();
     let defs', wf_relations = List.map (t_def env) defs |> List.split in
     let rec_defs = RecD defs' $ def.at in
     if List.concat wf_relations = [] then (rec_defs, []) else

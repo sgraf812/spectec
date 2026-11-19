@@ -560,6 +560,21 @@ let generate_matching_rules env before_prefix args tupt r =
       | NegPr {it = RulePr (id', _, _, _); _} -> String.starts_with ~prefix:before_prefix id'.it
       | _ -> false
     in
+    (* A well-formedness premise about the result of a function call (added by Undep) does not
+       decide whether `r` matches, and it would keep the call in `before`. *)
+    let call_outputs = List.fold_left (fun acc p -> match p.it with
+      | RulePr (id', _, _, {it = TupE exps; _}) when String.starts_with ~prefix:fun_prefix id'.it ->
+        (match Lib.List.last_opt exps with
+         | Some e -> Free.Set.union acc (Free.free_exp e).varid
+         | None -> acc)
+      | _ -> acc) Free.Set.empty prems in
+    let rec is_wf_prem p = match p.it with
+      | RulePr (id', _, _, _) -> String.starts_with ~prefix:"wf_" id'.it
+      | IterPr (p', _) -> is_wf_prem p'
+      | _ -> false
+    in
+    let prems = Lib.List.filter_not (fun p -> is_wf_prem p &&
+      not (Free.Set.is_empty (Free.Set.inter (Free.free_prem p).varid call_outputs))) prems in
     let prems' = Lib.List.filter_not is_exclusion (filter_return_prems prems prems) in
     (try Eval.match_list Eval.match_exp env.il_env Subst.empty args' args
      with Eval.Irred -> Some Subst.empty) |>
