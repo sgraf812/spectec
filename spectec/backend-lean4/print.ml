@@ -522,8 +522,11 @@ let render_typealias id binds typ =
    `deriving DecidableEq` has no handler. *)
 let classical_eq_types : StringSet.t ref = ref StringSet.empty
 
+(* The members of the nested type groups whose equality `decidable_group` defines. *)
+let generated_eq_types : StringSet.t ref = ref StringSet.empty
+
 let deriving_clause id =
-  if StringSet.mem id !classical_eq_types then "deriving Inhabited"
+  if StringSet.mem id !classical_eq_types || StringSet.mem id !generated_eq_types then "deriving Inhabited"
   else "deriving Inhabited, DecidableEq"
 
 let rec group_typds def =
@@ -555,7 +558,101 @@ let is_nested_group typds =
       List.exists (fun (_, (t, _, _), _) -> nested t) fields
     | _ -> false) typds
 
+(* Decidable equality of a nested type group. `deriving DecidableEq` has no handler for a type
+   that occurs in its own constructor arguments under a type constructor, so the equality test
+   is a structural mutual recursion: one function `_beq_T` per type `T` of the group and one per
+   type constructor application that contains the group (`List instr`, `list valtype`). Each
+   function matches its first argument, and for each constructor matches the second argument
+   against the same constructor. `_beq_T_iff` follows by the functional induction of the group,
+   and gives the instance. *)
+exception Unsupported_eq
+
+let decidable_code : (string, string) Hashtbl.t = Hashtbl.create 4
+
+let decidable_group typds : string =
+  let ids = List.map fst typds in
+  let rec mentions t =
+    match t.it with
+    | VarT (id, args) -> List.mem id.it ids || List.exists (fun a -> match a.it with
+        | TypA t' -> mentions t' | _ -> false) args
+    | IterT (t', _) -> mentions t'
+    | TupT ts -> List.exists (fun (_, t') -> mentions t') ts
+    | _ -> false
+  in
+  let helpers : (string * (string * string * string)) list ref = ref [] in
+  (* name, (argument type, definition body) *)
+  let fun_of_id id = "_beq_" ^ id in
+  let rec beq_expr t a b =
+    if not (mentions t) then "decide (" ^ a ^ " = " ^ b ^ ")" else
+    match t.it with
+    | VarT (id, []) when List.mem id.it ids -> fun_of_id id.it ^ " " ^ a ^ " " ^ b
+    | _ -> helper_of t ^ " " ^ a ^ " " ^ b
+  and variant_arms cases =
+    let one = List.length cases = 1 in
+    String.concat "" (List.map (fun (m, (ct, _, _), _) ->
+      let args = transform_case_args ct in
+      let xs = List.mapi (fun i _ -> "x" ^ string_of_int i) args in
+      let ys = List.mapi (fun i _ -> "y" ^ string_of_int i) args in
+      let ctor = "." ^ render_mixop m in
+      let pat vs = if vs = [] then ctor else parens (String.concat " " (ctor :: vs)) in
+      let conj = match args with
+        | [] -> "true"
+        | _ ->
+          (* Right-associated, like the conjunction of constructor injectivity. *)
+          let cs = List.map2 (fun (x, y) (_, t) -> parens (beq_expr t x y)) (List.combine xs ys) args in
+          List.fold_right (fun c acc -> if acc = "" then c else c ^ " && " ^ parens acc) cs "" in
+      "\n  | " ^ pat xs ^ ", b => match b with | " ^ pat ys ^ " => " ^ conj ^
+        (if one then "" else " | _ => false")) cases)
+  and helper_of t =
+    let key = render_type REL t in
+    match List.assoc_opt key (List.map (fun (n, (k, _, _)) -> (k, n)) !helpers) with
+    | Some n -> n
+    | None ->
+      let n = "_beq_" ^ (match ids with i :: _ -> i | [] -> "") ^ "_h" ^ string_of_int (List.length !helpers) in
+      helpers := !helpers @ [ (n, (key, "", "")) ];
+      let body = match t.it with
+        | IterT (t', List) ->
+          "\n  | [], b => match b with | [] => true | _ => false" ^
+          "\n  | x :: xs, b => match b with | y :: ys => " ^ parens (beq_expr t' "x" "y") ^ " && " ^ n ^ " xs ys | _ => false"
+        | IterT (t', Opt) ->
+          "\n  | none, b => match b with | none => true | _ => false" ^
+          "\n  | some x, b => match b with | some y => " ^ beq_expr t' "x" "y" ^ " | _ => false"
+        | VarT (_, _ :: _) ->
+          (match (try Some (Il.Eval.reduce_typdef !env_ref t) with _ -> None) with
+           | Some { it = VariantT cases; _ } -> variant_arms cases
+           | _ -> raise Unsupported_eq)
+        | _ -> raise Unsupported_eq
+      in
+      helpers := List.map (fun (n', v) -> if n' = n then (n, (key, key, body)) else (n', v)) !helpers;
+      n
+  in
+  let types = List.map (fun (id, inst) -> match inst.it with
+    | InstD ([], _, { it = VariantT cases; _ }) -> (id, variant_arms cases)
+    | _ -> raise Unsupported_eq) typds in
+  let fns = List.map (fun (id, _) -> fun_of_id id) types @ List.map fst !helpers in
+  let sigs = List.map (fun (id, body) -> (fun_of_id id, render_id id, body)) types @
+    List.map (fun (n, (_, ty, body)) -> (n, ty, body)) !helpers in
+  let defs = String.concat "\n" (List.map (fun (n, ty, body) ->
+    "def " ^ n ^ " : " ^ ty ^ " → " ^ ty ^ " → Bool" ^ body) sigs) in
+  let simp_set = "[" ^ String.concat ", " fns ^ "]" in
+  let motives = String.concat "" (List.map (fun (n, ty, _) ->
+    "\n    | exact (fun (a b : " ^ ty ^ ") => " ^ n ^ " a b = true ↔ a = b)") sigs) in
+  let proofs = String.concat "\n\n" (List.map (fun (id, _) ->
+    let f = fun_of_id id in
+    "theorem " ^ f ^ "_iff : ∀ a b : " ^ render_id id ^ ", " ^ f ^ " a b = true ↔ a = b := by\n" ^
+    "  apply " ^ f ^ ".induct\n  all_goals try first" ^ motives ^ "\n  all_goals intros\n" ^
+    "  all_goals first\n    | (simp_all " ^ simp_set ^ "; done)\n" ^
+    "    | (rename_i y h; constructor\n" ^
+    "       · intro e; simp only " ^ simp_set ^ " at e; first | (simp at e; done) | (split at e <;> simp_all)\n" ^
+    "       · rintro rfl; first | (simp_all; done) | (exfalso; apply h <;> rfl))\n\n" ^
+    "instance : DecidableEq " ^ render_id id ^ " := fun a b => decidable_of_iff _ (" ^ f ^ "_iff a b)")
+    types) in
+  "\n\nset_option linter.unusedSimpArgs false in\nmutual\n" ^ defs ^ "\nend\n\n" ^ proofs
+
 let classical_instances def =
+  match List.find_map (fun (id, _) -> Hashtbl.find_opt decidable_code id) (group_typds def) with
+  | Some code -> code
+  | None ->
   String.concat "" (List.filter_map (fun (id, inst) ->
     if not (StringSet.mem id !classical_eq_types) then None else
     let InstD (binds, _, _) = inst.it in
@@ -993,8 +1090,13 @@ let string_of_script (il : script) =
   let defs = List.filter_map prune_def il in
   classical_eq_types := List.fold_left (fun acc d ->
     let typds = group_typds d in
-    if is_nested_group typds then List.fold_left (fun acc (id, _) -> StringSet.add id acc) acc typds
-    else acc) StringSet.empty defs;
+    if not (is_nested_group typds) then acc else
+    match (try Some (decidable_group typds) with Unsupported_eq -> None) with
+    | Some code ->
+      (match typds with (id, _) :: _ -> Hashtbl.replace decidable_code id code | [] -> ());
+      generated_eq_types := List.fold_left (fun acc (id, _) -> StringSet.add id acc) !generated_eq_types typds;
+      acc
+    | None -> List.fold_left (fun acc (id, _) -> StringSet.add id acc) acc typds) StringSet.empty defs;
   exported_string ^ Builtins.prelude ^
   "/- Generated Code -/\n\n" ^
   String.concat "\n\n" (List.map (fun d -> string_of_def d ^ classical_instances d) defs)
