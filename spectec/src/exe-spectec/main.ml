@@ -84,6 +84,7 @@ let ast_width = ref Backend_ast.Config.default.width
 let latex_macros = ref false
 let rocq_namespace = ref ""
 let lean4_import = ref "Wasm"
+let lean4_wf_skip = ref ""
 
 let print_el = ref false
 let print_elab_il = ref false
@@ -242,6 +243,7 @@ let argspec = Arg.align (
   "--interpreter", Arg.Rest_all (fun args -> target := Interpreter args),
     " Generate interpreter";
   "--rocq", Arg.Unit (fun () -> target := Rocq), " Generate Rocq Inductive Definitions (-o main.v [wf.v]: well-formedness lemmas go to wf.v, default main_wf.v)";
+  "--lean4-wf-skip", Arg.Set_string lean4_wf_skip, " File of well-formedness lemmas, one per line, that the Lean 4 output only states";
   "--lean4-import", Arg.Set_string lean4_import, " Lean module that the Lean 4 interpreter file imports (-o main.lean interp.lean [wf.lean])";
   "--rocq-namespace", Arg.Set_string rocq_namespace, " Logical path used by the Rocq well-formedness lemma file to import the main file";
   "--lean4", Arg.Unit (fun () -> target := Lean4), " Generate Lean4 specification";
@@ -486,7 +488,10 @@ let () =
       | [odst; idst; wdst] ->
         let code = Backend_lean4.Print.string_of_script il in
         let interp = Backend_lean4.Interp.string_of_interp !lean4_import il in
-        let wf = Backend_lean4.Print.string_of_wf_lemmas !lean4_import il in
+        let skip = if !lean4_wf_skip = "" then [] else
+          In_channel.with_open_text !lean4_wf_skip In_channel.input_lines
+          |> List.map String.trim |> List.filter (fun l -> l <> "") in
+        let wf = Backend_lean4.Print.string_of_wf_lemmas ~skip !lean4_import il in
         List.iter (fun (dst, text) ->
           let oc = Out_channel.open_text dst in
           Fun.protect (fun () -> Out_channel.output_string oc text)

@@ -1125,6 +1125,53 @@ let string_of_script (il : script) =
 (* The well-formedness lemmas, as theorems about the model. A lemma about an opaque function is
    only stated, as a proposition. The proof introduces the hypotheses, takes apart each
    function relation among them, and closes each case with `wf_tac`. *)
+(* The lemmas whose generated proof fails: they are only stated. *)
+let wf_skip : StringSet.t ref = ref StringSet.empty
+
+let is_self_recursive (r : id) =
+  match Il.Env.find_opt_rel !env_ref r with
+  | Some (_, _, _, rules) ->
+    let rec mentions (p : prem) = match p.it with
+      | RulePr (r', _, _, _) -> r'.it = r.it
+      | IterPr (p', _) | NegPr p' -> mentions p'
+      | _ -> false
+    in
+    List.exists (fun rule -> match rule.it with
+      | RuleD (_, _, _, _, prems) -> List.exists mentions prems) rules
+  | None -> false
+
+(* A record whose fields are lists and which has a well-formedness predicate keeps it under
+   `++`. *)
+let wf_append_lemma (d : def) = match d.it with
+  | TypD (id, [], [ { it = InstD (_, _, { it = StructT fields; _ }); _ } ])
+    when not (StringSet.mem ("wf_" ^ id.it ^ "_append") !wf_skip) && List.for_all (fun (_, (t, _, _), _) -> match t.it with IterT (_, List) -> true | _ -> false) fields
+      && (match Il.Env.find_opt_rel !env_ref ("wf_" ^ id.it $ id.at) with
+          | Some (_, _, t, _) -> (match t.it with
+            | VarT (id', []) | TupT [ (_, { it = VarT (id', []); _ }) ] -> id'.it = id.it
+            | _ -> false)
+          | None -> false) ->
+    let r = render_id id.it in
+    Some ("@[grind ←]\ntheorem wf_" ^ id.it ^ "_append (a b : " ^ r ^ ") (ha : wf_" ^ id.it ^
+      " a) (hb : wf_" ^ id.it ^ " b) :\n    wf_" ^ id.it ^ " (a ++ b) := by\n" ^
+      "  rw [show a ++ b = _append_" ^ id.it ^ " a b from rfl]\n  cases ha; cases hb\n" ^
+      "  constructor <;> simp_all [Forall, _append_" ^ id.it ^ "] <;> (rintro x (h | h) <;> simp_all)")
+  | _ -> None
+
+(* The definitions among `ids` that the model prints with equations, so that `simp` can unfold
+   them. *)
+let unfoldable (ids : string list) =
+  List.filter (fun f -> match Il.Env.find_opt_def !env_ref (f $ no_region) with
+    | Some (params, typ, (_ :: _ as clauses)) ->
+      is_supported_function (f $ no_region) params typ clauses && not (List.mem f builtins)
+    | Some _ -> List.mem_assoc f Builtins.bodies
+    | None -> false) ids
+
+let wf_tactic (defs : string list) =
+  let set = String.concat ", " ("Forall" :: List.map render_id defs) in
+  "(subst_vars; first | (simp_all [" ^ set ^ "]; done) | (simp_all [" ^ set ^ "] <;> grind [" ^ set ^
+  "]) | grind [" ^ set ^ "] | ((repeat' constructor) <;> (first | assumption | (simp_all [" ^ set ^
+  "]; done) | omega | decide); done))"
+
 let render_wf_lemma id (rule : rule) is_axiom =
   match rule.it with
   | RuleD (_, quants, _, exp, prems) ->
@@ -1137,35 +1184,79 @@ let render_wf_lemma id (rule : rule) is_axiom =
     let statement =
       string_of_list "∀ " ", " " " (render_quant REL) quants' ^
       String.concat "" (List.map (fun h -> h ^ " →\n    ") hyp_strs) ^ render_prem concl in
-    if is_axiom then "def " ^ id ^ " : Prop :=\n  " ^ statement else
-    let cases = List.concat (List.mapi (fun i (p : prem) -> match p.it with
+    if is_axiom || StringSet.mem id !wf_skip then "def " ^ id ^ " : Prop :=\n  " ^ statement else
+    let rels = List.concat (List.mapi (fun i (p : prem) -> match p.it with
       | RulePr (r, _, _, _) when String.length r.it > 4 && String.sub r.it 0 4 = "fun_" ->
-        [ "h" ^ string_of_int i ]
+        [ ("h" ^ string_of_int i, r) ]
       | _ -> []) hyps) in
-    "theorem " ^ id ^ " :\n    " ^ statement ^ " := by\n  intro " ^
-    String.concat " " (List.map (fun q -> get_param_id q |> render_id) quants' @ names) ^ "\n" ^
-    String.concat "" (List.map (fun h -> "  cases " ^ h ^ " <;>\n") cases) ^ "  wf_tac"
+    let intro = "  intro " ^
+      String.concat " " (List.map (fun q -> get_param_id q |> render_id) quants' @ names) ^
+      "\n  subst_vars\n" in
+    let cases_of hs = String.concat "" (List.map (fun (h, _) -> "cases " ^ h ^ " <;> ") hs) in
+    let defs = unfoldable (Il.Free.Set.elements (Il.Free.free_list Il.Free.free_prem hyps).Il.Free.defid) in
+    let wf_tac = wf_tactic defs in
+    (* Induction on the first self-recursive relation, with the other hypotheses reverted, so
+       that the induction hypothesis assumes them for the recursive premises. *)
+    let body = match List.find_opt (fun (_, r) -> is_self_recursive r) rels with
+      | Some (h, r) ->
+        let others = List.filter (fun n -> n <> h) names in
+        "  first\n    | (" ^ String.concat "" (List.map (fun n -> "(try revert " ^ n ^ "); ") (List.rev others)) ^
+        "induction " ^ h ^ " <;> intros <;> " ^ cases_of (List.filter (fun (h', _) -> h' <> h) rels) ^
+        wf_tac ^ ")\n    | (" ^ cases_of rels ^ wf_tac ^ ")"
+        |> fun b -> ignore r; b
+      | None -> "  " ^ cases_of rels ^ wf_tac
+    in
+    "@[grind]\ntheorem " ^ id ^ " :\n    " ^ statement ^ " := by\n" ^ intro ^ body
 
 let wf_prelude = {|
 set_option linter.unusedVariables false
+set_option linter.unusedSimpArgs false
+
+@[simp, grind =] theorem wf_uN_mk_iff (N i : Nat) : wf_uN N (.mk_uN i) ↔ i < 2 ^ N := by
+  have := Nat.two_pow_pos N
+  constructor
+  · intro h; cases h; generalize 2 ^ N = p at *; simp only [Int.ofNat_eq_natCast] at *; omega
+  · intro h; exact .uN_case_0 _ _ ⟨by omega, by generalize 2 ^ N = p at *; simp only [Int.ofNat_eq_natCast] at *; omega⟩
+      (by generalize 2 ^ N = p at *; simp only [Int.ofNat_eq_natCast] at *; omega)
+
+@[simp, grind .] theorem mod_two_pow_lt (x N : Nat) : x % 2 ^ N < 2 ^ N := Nat.mod_lt _ (Nat.two_pow_pos N)
+
+@[grind .] theorem bool_le_one (b : Bool) : Builtins.bool b ≤ 1 := by
+  cases b <;> simp [Builtins.bool]
+
+@[grind .] theorem tmod_lt_of_nonneg (a p : Int) (hp : 0 < p) (ha : 0 ≤ a) : Int.tmod a p < p := by
+  rw [Int.tmod_eq_emod_of_nonneg ha]; exact Int.emod_lt_of_pos a hp
+
+@[grind .] theorem tmod_nonneg_of_nonneg (a p : Int) (hp : 0 < p) (ha : 0 ≤ a) : 0 ≤ Int.tmod a p := by
+  rw [Int.tmod_eq_emod_of_nonneg ha]; exact Int.emod_nonneg a (by omega)
 
 /-- Closes a goal `wf_T x` once the function relations among the hypotheses are taken apart. -/
 macro "wf_tac" : tactic => `(tactic| (
   subst_vars
   first
-    | (simp_all; done)
-    | (repeat' constructor) <;> (first | assumption | (simp_all; done) | omega | decide)
-    | grind))
+    | (simp_all [Forall]; done)
+    | (simp_all [Forall] <;> grind [Forall])
+    | grind [Forall]
+    | ((repeat' constructor) <;> (first | assumption | (simp_all [Forall]; done) | omega | decide); done)))
 |}
 
-let string_of_wf_lemmas (import : string) (il : script) =
-  ignore il;
+let string_of_wf_lemmas ?(skip = []) (import : string) (il : script) =
+  wf_skip := StringSet.of_list skip;
   let lemmas = ref [] in
   let rec go (d : def) = match d.it with
     | RelD (id, _, _, _, [ rule ]) when Hashtbl.mem wf_lemmas id.it ->
       lemmas := !lemmas @ [ render_wf_lemma id.it rule (Hashtbl.find wf_lemmas id.it) ]
     | RecD ds -> List.iter go ds
+    | TypD _ -> (match wf_append_lemma d with Some l -> lemmas := !lemmas @ [ l ] | None -> ())
     | _ -> ()
   in
   List.iter go il;
-  "import " ^ import ^ "\n" ^ wf_prelude ^ "\n" ^ String.concat "\n\n" !lemmas ^ "\n"
+  (* `grind` inverts a well-formedness hypothesis and proves a well-formedness goal by its
+     constructors. *)
+  let wf_rels = List.sort compare (List.filter_map (fun (d : def) -> match d.it with
+    | RelD (id, _, _, _, _ :: _) when String.starts_with ~prefix:"wf_" id.it -> Some id.it
+    | _ -> None) (List.concat_map (fun (d : def) -> match d.it with RecD ds -> ds | _ -> [ d ]) il)) in
+  let attrs = if wf_rels = [] then "" else
+    "attribute [grind cases] " ^ String.concat " " wf_rels ^ "\n" ^
+    "attribute [grind intro] " ^ String.concat " " wf_rels ^ "\n" in
+  "import " ^ import ^ "\n" ^ wf_prelude ^ "\n" ^ attrs ^ "\n" ^ String.concat "\n\n" !lemmas ^ "\n"
